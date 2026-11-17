@@ -35,7 +35,7 @@ jobs = H3_JOBS  # noqa: F821  (injected by the caller)
 for i, job in enumerate(jobs, 1):
     job = dict(job)
     kind = job.pop("kind")
-    print(f"[{i}/{len(jobs)}] 生成中…（第一张要先把权重读进显存，会多等 1～2 分钟）" if i == 1 else f"[{i}/{len(jobs)}] 生成中…",
+    print(f"[{i}/{len(jobs)}] 生成中…（第一张要先把权重读进显存，会慢一些）" if i == 1 else f"[{i}/{len(jobs)}] 生成中…",
           flush=True)
     try:
         r = h3.generate(**job) if kind == "t2i" else h3.edit(**job)

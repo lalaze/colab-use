@@ -17,9 +17,9 @@ colab usage                           # 一次性：浏览器授权 Google 账�
 
 - **生图要用的是 `MiniMax-H3-Image`**（2026-11-10 开源）。`MiniMax-H3` 本体是**视频+音频**模型，不出静态图。
 - **推荐的组合是 ComfyUI ≥ 0.45 加 [Comfy-Org 重新打包的权重](https://huggingface.co/Comfy-Org/MiniMax-H3-Image)**，DiT 和文本编码器都用 int8-ConvRot，一共约 49 GB。官方 diffusers 仓库需要下载约 135 GB，在 Colab 上每次开机都得重新下载，所以不划算。
-- **GPU 首选 A100 80GB**（约 7 CU/小时）。Pro+ 用户用 G4（RTX PRO 6000 96GB）更快。L4 和 T4 不推荐。
+- **GPU 首选 A100 80GB**（实测约 8.9 CU/小时）。Pro+ 用户用 G4（RTX PRO 6000 96GB）更快。L4 和 T4 不推荐。
 - **省 CU 的办法**：Colab 按 VM 开着的时长计费，不管 GPU 有没有在算。所以要攒一批提示词一次跑完，再立刻 `./h3 down`。批量任务可以加 `--down`，跑完自动关机。
-- ⚠️ **许可证不覆盖美国、欧盟、英国和韩国**，而 Colab 的 VM 通常分配在美国。详见下文「许可证」一节。
+- ⚠️ **许可证不覆盖美国、欧盟、英国和韩国**，而 Colab 的 VM 不能选地区，经常分配在美国。详见下文「许可证」一节。
 
 ## H3 和 H3-Image
 
@@ -51,17 +51,17 @@ Comfy-Org 打包的权重为什么这么小：
 
 | 运行时 | 显存 | 约 CU/小时 | 说明 |
 |---|---|---|---|
-| A100 80GB（High-RAM） | 80 GB | ~7 | **首选**。int8 权重（约 46 GiB）可以全部留在显存里 |
+| A100 80GB（High-RAM） | 80 GB | ~8.9（2026-11 实测） | **首选**。int8 权重（约 46 GiB）可以全部留在显存里 |
 | G4 RTX PRO 6000 | 96 GB | ~9 | 仅 Pro+。Blackwell 架构，比 A100 快；bf16 DiT 也放得下 |
 | H100 | 80 GB | 5～18（社区实测差异大） | 仅 Pro+。最快，先在资源面板确认费率 |
 | A100 40GB | 40 GB | ~5.3 | 能跑，但文本编码器要在显存和内存之间来回换，较慢 |
 | L4 / T4 | 24 / 16 GB | — | 不推荐（T4 不支持 bf16） |
 
-CU 费率来自社区测量，Google 不公布，以 Colab 资源面板显示为准。
+CU 费率除标注实测的以外都来自社区测量。Google 不公布费率，以 Colab 资源面板或 `./h3 status` 显示的为准。
 
-**每张图的耗时**：根据 vLLM-Omni 官方给出的 H200 数据推算，A100 上 4MP 大约十几秒，16MP 大约一分钟上下，H100 和 G4 更快。这些都是推算值，以 `./h3 gen` 打印的实际耗时为准。第一张图要先把权重读进显存，会额外多 1～2 分钟。
+**每张图的耗时**（2026-11 在 A100 80GB 上实测）：4MP 文生图 30.5 秒，这已经包含第一张图把权重读进显存的时间；4MP 编辑（1 张参考图）19.4 秒。16MP 还没有实测，像素是 4MP 的 4 倍，耗时至少也是 4 倍，以 `./h3 gen` 打印的实际耗时为准。H100 和 G4 更快。
 
-**固定开销**：每次开机安装加下载约 10 分钟，在 A100 上约 1～1.5 CU。所以 Colab 适合攒一批提示词一次跑完。按 Pro 的价格（$9.99/100 CU）算，A100 上一张 16MP 图大约 0.1 CU，约 $0.01。作为对比，MiniMax 官方 API 的 4K 图价格约 $0.069 一张。
+**固定开销**：实测 `./h3 up` 用时 11.1 分钟，其中下载权重 10 分钟，在 A100 上约 1.6 CU。那次下载没有用上 hf_xet；现在下载放在单独的子进程里，CPU VM 上实测单个文件约 0.15 GB/s，A100 上应该能快一些。所以 Colab 适合攒一批提示词一次跑完。按 Pro 的价格（$9.99/100 CU）算，A100 上一张 16MP 图大约 0.1 CU，约 $0.01。作为对比，MiniMax 官方 API 的 4K 图价格约 $0.069 一张。
 
 ## 用法
 
@@ -106,6 +106,16 @@ CU 费率来自社区测量，Google 不公布，以 Colab 资源面板显示为
 
 ComfyUI 作为后台进程跑在 VM 上，`remote/h3_comfy.py` 通过 `127.0.0.1:8188` 的 API 提交工作流。工作流参数和官方模板一致：euler / simple / 6 步 / cfg 1。
 
+### 常见问题
+
+| 现象 | 原因和解决办法 |
+|---|---|
+| 授权时报 `Scope has changed from ... to ...` | 授权页上没有勾选全部权限。重新运行 `colab usage`，在授权页勾选“全选”再继续 |
+| 授权成功了，但下一条命令又要重新登录；之前出现过 `Could not save the OAuth token to the OS keyring` | macOS 钥匙串不可写（常见于 SSH 登录的终端）。先运行 `security unlock-keychain ~/Library/Keychains/login.keychain-db`，再重新授权 |
+| `./h3 up` 报 `Service Unavailable`（503） | 这种 GPU 暂时没有空闲。过几分钟重试，或者换 `--gpu G4` / `--gpu H100` |
+| 下载权重很慢 | 看 `up` 日志里的 `hf_xet：` 一行：显示“未启用”说明退回了普通 HTTP |
+| 在 Claude Code 等沙箱里运行 `colab` 时卡在授权或请求超时 | 沙箱拦截了 `oauth2.googleapis.com` 等域名。在沙箱外运行 |
+
 ## 许可证
 
 MiniMax-H3-Image Community License（[原文](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE)）的要点：
@@ -113,12 +123,12 @@ MiniMax-H3-Image Community License（[原文](https://huggingface.co/MiniMaxAI/M
 - 授权地域为全球，**但排除欧盟、英国、韩国和美国**；在排除地域使用模型或其输出不在授权范围内。排除地域的用户可以联系 MiniMax 单独申请授权。
 - 年收入超过 100 万美元，或者对第三方提供托管服务（API、网页等），需要事先申请书面授权。
 
-Colab 不能选择机房，VM 通常分配在美国。`./h3 up` 会通过 ipinfo.io 显示 VM 所在地（用 `--no-location-check` 关掉）。运行前请自己确认用法是否合规。
+Colab 不能选择机房。实测分配到过美国（us-east4）和新加坡，同一账号每次可能不同。`./h3 up` 会通过 ipinfo.io 显示 VM 所在地（用 `--no-location-check` 关掉）。运行前请自己确认用法是否合规。
 
 ## 文件说明
 
 - `h3`：本机命令行入口，Python 3 标准库，不需要装任何依赖。
-- `remote/setup.py`：在 VM 上执行的初始化脚本，负责检查硬件和所在地、安装 ComfyUI、并行下载权重、启动服务，最后写出 `/content/h3_config.json`。
+- `remote/setup.py`：在 VM 上执行的初始化脚本，负责检查硬件和所在地、安装 ComfyUI、并行下载权重（放在单独的子进程里执行，确保用上 hf_xet）、启动服务，最后写出 `/content/h3_config.json`。
 - `remote/generate.py`：在 VM 上执行的生成任务，每完成一张输出一行 `H3_RESULT`，本机据此下载。
 - `remote/h3_comfy.py`：只用标准库的 ComfyUI API 客户端，负责拼工作流、提交任务、轮询结果、上传参考图。
 - `tools/validate_graphs.py`：用本地（CPU）ComfyUI 的校验逻辑检查工作流，确认节点名、参数名和取值都合法，不需要 GPU，也不需要真实权重。
