@@ -6,7 +6,7 @@
 uv tool install google-colab-cli      # 一次性：安装官方 Colab CLI
 colab usage                           # 一次性：浏览器授权 Google 账号，顺便看 CU 余额
 
-./h3 up                               # 开 A100 80GB → 装 ComfyUI → 下载 ~49GB 权重 → 启动（约 10 分钟）
+./h3 up                               # 开 A100 80GB（没空就换 G4、自动重试）→ 装 ComfyUI → 下载 ~49GB 权重 → 启动（约 10 分钟）
 ./h3 gen "A detailed English prompt ..." -n 2         # 文生图，PNG 下载到 ./outputs/
 ./h3 gen -f prompts.txt --mp 4                        # 批量，用 4MP 先试提示词
 ./h3 edit "Keep <Picture 1> ..., but ..." photo.png   # 改图 / 多图参考
@@ -84,7 +84,7 @@ CU 费率除标注实测的以外都来自社区测量。Google 不公布费率�
 
 | 命令 | 作用 |
 |---|---|
-| `./h3 up [--gpu A100\|G4\|H100] [--dit int8\|bf16] [--enhancer]` | 开机（默认 A100 加 `--high-mem`）、装 ComfyUI、下载权重、启动服务。可以重复执行，已有的步骤会跳过。会话已存在时直接复用，不会再开一台 |
+| `./h3 up [--gpu A100,G4,H100] [--wait 10m] [--dit int8\|bf16] [--enhancer]` | 开机、装 ComfyUI、下载权重、启动服务。可以重复执行，已有的步骤会跳过。会话已存在时直接复用，不会再开一台。开机时按 `--gpu` 的顺序申请（默认 `A100,G4`，都加 `--high-mem`），都没空就每 30 秒再试一轮，最多等 `--wait`（默认 10 分钟，`0` 表示只试一轮）。账号没权限的 GPU 会自动跳过 |
 | `./h3 gen "prompt" [-n 2] [--aspect 16:9] [--mp 16] [--seed 42] [--enhance] [--down]` | 文生图。`-f prompts.txt` 为批量模式，每行一条，`#` 开头的行忽略 |
 | `./h3 edit "prompt" a.png [b.png ...]` | 图像编辑或多图参考（最多 16 张），提示词里用 `<Picture 1>`、`<Picture 2>`… 指代 |
 | `./h3 ui` | 通过 SSH 端口转发，在本机浏览器打开 `http://127.0.0.1:8188` 使用 ComfyUI 网页界面，只有你自己能访问 |
@@ -135,7 +135,8 @@ ComfyUI 作为后台进程跑在 VM 上，`remote/h3_comfy.py` 通过 `127.0.0.1
 |---|---|
 | 授权时报 `Scope has changed from ... to ...` | 授权页上没有勾选全部权限。重新运行 `colab usage`，在授权页勾选“全选”再继续 |
 | 授权成功了，但下一条命令又要重新登录；之前出现过 `Could not save the OAuth token to the OS keyring` | macOS 钥匙串不可写（常见于 SSH 登录的终端）。先运行 `security unlock-keychain ~/Library/Keychains/login.keychain-db`，再重新授权 |
-| `./h3 up` 报 `Service Unavailable`（503） | 这种 GPU 暂时没有空闲。过几分钟重试，或者换 `--gpu G4` / `--gpu H100` |
+| `./h3 up` 报「都没有空闲」 | 这几种 GPU 一直返回 `Service Unavailable`（503）。付费也不保证能拿到卡，2026 年 6 月起 A100、H100、G4 经常紧张，官方说是算力不够（[colabtools#6014](https://github.com/googlecolab/colabtools/issues/6014)）。等待期间没有开机，不扣 CU。可以过一会儿再试，加大 `--wait`（如 `--wait 30m`），或者多加几种 GPU（如 `--gpu A100,G4,H100`） |
+| `./h3 up` 说账号下多了一台「没有本地记录的 VM」 | 申请 GPU 的请求超时了，但服务器还是分配了 VM。这台 VM 在计费，`h3 down` 和 `colab stop` 都关不掉。打开 Colab 网页，在「运行时 → 管理会话」里终止它，再重新 `./h3 up` |
 | 下载权重很慢 | 看 `up` 日志里的 `hf_xet：` 一行：显示“未启用”说明退回了普通 HTTP |
 | 在 Claude Code 等沙箱里运行 `colab` 时卡在授权或请求超时 | 沙箱拦截了 `oauth2.googleapis.com` 等域名。在沙箱外运行 |
 

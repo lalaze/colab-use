@@ -3,7 +3,7 @@
 
 基于谷歌官方 Colab CLI（`colab`，安装：uv tool install google-colab-cli）。
 
-    ./h3 up                         开一台 A100 80GB，装 ComfyUI，下载权重，启动服务
+    ./h3 up                         开一台 A100 80GB（没空就换 G4，自动重试），装 ComfyUI，下载权重，启动服务
     ./h3 gen "a prompt" -n 2        文生图，结果下载到 ./outputs
     ./h3 gen -f prompts.txt         批量（每行一条提示词，# 开头的行忽略）
     ./h3 edit "<Picture 1> ..." a.png b.png    图像编辑 / 多图参考
@@ -26,7 +26,8 @@
     - 每开一次机固定要花约 1.6 CU（约 $0.16），等约 11 分钟；一次至少出 4～5 张 16MP 定稿，才比官方 API 便宜。
       不到 4 张定稿时，先问用户：是现在就开机，还是攒成一批再生成。
       一批任务（先用 --mp 4 试稿，再出 16MP 定稿）要在同一次开机里全部做完，不要中途 down 再 up
-    - up 约 11 分钟，16MP 每张可能要几分钟：命令超时至少给 20 分钟，或者放到后台运行
+    - up 约 11 分钟；GPU 都没空时会每 30 秒重试，最多再等 10 分钟（--wait），等待期间不扣 CU，
+      等不到就以非 0 退出、不开机。16MP 每张可能要几分钟：命令超时至少给 30 分钟，或者放到后台运行
     - 提示词写详细的英文；画面里要出现的文字用引号括起来；不支持 negative prompt；先用 --mp 4 试，定稿再用 16
     - 默认所有调用共用一个会话（名字叫 h3，即同一台 VM），只能由一个调用方负责 down；
       需要隔离就用 h3 -s 名字 ...（每个会话单独开一台 VM，分别计费）
@@ -39,6 +40,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -93,8 +95,8 @@ def colab_bin() -> str:
     return path
 
 
-def colab(*args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run([colab_bin(), *args], text=True, capture_output=capture)
+def colab(*args: str, capture: bool = False, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+    r = subprocess.run([colab_bin(), *args], text=True, capture_output=capture, env=env)
     if check and r.returncode != 0:
         if capture:
             sys.stderr.write(r.stdout + r.stderr)
@@ -159,6 +161,123 @@ def build_code(script: str, **variables) -> str:
     return head + (REMOTE / script).read_text(encoding="utf-8")
 
 
+# ------------------------------------------------------------------ GPU allocation
+
+POLL_SECONDS = 30
+# We do the waiting ourselves so we can rotate GPUs. One CLI-level retry is kept on purpose: before
+# retrying, the CLI checks whether a timed-out request assigned a VM anyway, which prevents orphan VMs.
+NEW_ENV = {"COLAB_CLI_ASSIGN_RETRIES": "1", "COLAB_CLI_RETRY_BACKOFF": "5"}
+BUSY_REASONS = ("Service Unavailable", "Bad Gateway", "Gateway Timeout", "Too Many Requests")
+
+
+def _gpu_list(s: str) -> list[str]:
+    gpus: list[str] = []
+    for g in s.upper().replace(" ", "").split(","):
+        if g not in GPUS:
+            raise argparse.ArgumentTypeError(f"不认识的 GPU {g!r}，可选 {', '.join(GPUS)}，多个用逗号隔开（如 A100,G4）")
+        if g not in gpus:
+            gpus.append(g)
+    return gpus
+
+
+def _duration(s: str) -> float:
+    """'0' / '90' / '90s' / '15m' / '1h' -> seconds."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*", s.lower())
+    if not m:
+        raise argparse.ArgumentTypeError(f"时长格式不对：{s!r}（例如 0、90s、15m、1h）")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def _classify_new_failure(out: str) -> tuple[str, str]:
+    """Why `colab new` failed (output read with a standard traceback, see _allocate):
+    busy = no free GPU right now (retry), denied = the account can't use this GPU,
+    uncertain = timeout or network error (a VM may have been assigned anyway), fatal = anything else."""
+    flat = " ".join(out.split())
+    if "Backend rejected accelerator" in flat:  # HTTP 400
+        return "denied", "账号没有这种 GPU 的权限或配额"
+    if "Allocation refused" in flat:  # HTTP 412
+        return "busy", "412：临时限额，或者开着的会话太多"
+    m = re.search(r"ColabRequestError: Failed to issue request \S+ \S+: (.+)", out)
+    if m:
+        reason = m.group(1).strip()
+        return ("busy" if reason in BUSY_REASONS else "fatal"), reason
+    if re.search(r"ReadTimeout|Read timed out|ConnectTimeout|ConnectionError|Connection aborted|RemoteDisconnected", out):
+        return "uncertain", "请求超时或网络中断"
+    return "fatal", (out.strip().splitlines() or ["（没有输出）"])[-1]
+
+
+def _backend_assignments() -> dict[str, str] | None:
+    """endpoint -> local session name ('?' = no local record) for every VM on the account; None if unknown."""
+    r = colab("sessions", capture=True, check=False)
+    if r.returncode != 0:
+        return None
+    return {m.group(2): m.group(1) for m in re.finditer(r"^\[(.+?)\] (\S+) \|", r.stdout, re.M)}
+
+
+def _check_no_orphan(before: dict[str, str]):
+    """After a timed-out `colab new`: stop if the account gained a VM that no local session owns (it bills)."""
+    for _ in range(3):
+        now = _backend_assignments()
+        if now is not None:
+            break
+        time.sleep(5)
+    else:
+        die("申请 GPU 的请求超时了，而且查不到账号下有哪些 VM（网络问题？）。为了不重复开机，先停在这里。\n"
+            "用 `colab sessions` 确认：[?] 开头的是没有本地记录、但在计费的 VM。")
+    orphans = [ep for ep, name in now.items() if name == "?" and ep not in before]
+    if orphans:
+        die(f"申请 GPU 的请求超时了，但账号下多了 {len(orphans)} 台没有本地记录的 VM（{', '.join(orphans)}），"
+            f"它在计费，h3 和 colab 命令都关不掉它。\n请打开 https://colab.research.google.com ，"
+            f"在「运行时 → 管理会话」里终止它，然后再运行 `{PROG} up`。")
+
+
+def _allocate(a) -> str:
+    """`colab new` with the first free GPU in a.gpu; poll every POLL_SECONDS until a.wait runs out."""
+    gpus = list(a.gpu)
+    wait_txt = ("只试一轮" if a.wait <= 0 else f"最多等 {a.wait:g} 秒" if a.wait < 60
+                else f"最多等 {a.wait / 60:.3g} 分钟")
+    print(f"申请 GPU：{' → '.join(gpus)}（都没空就每 {POLL_SECONDS} 秒再试一轮，{wait_txt}；分配到 VM 之前不扣 CU）")
+    # A standard traceback keeps the CLI's error on one line (rich's pretty one wraps it mid-word).
+    env = {**NEW_ENV, **os.environ, "_TYPER_STANDARD_TRACEBACK": "1"}
+    before = _backend_assignments() or {}
+    t0, rounds = time.monotonic(), 0
+    try:
+        while True:
+            rounds += 1
+            for gpu in list(gpus):
+                args = ["new", "-s", a.session, "--gpu", gpu] + ([] if a.no_high_mem else ["--high-mem"])
+                r = colab(*args, capture=True, check=False, env=env)
+                if r.returncode == 0:
+                    waited = (time.monotonic() - t0) / 60
+                    print(f"✓ 拿到 {gpu}" + (f"（第 {rounds} 轮，等了 {waited:.1f} 分钟）" if rounds > 1 else ""))
+                    return gpu
+                kind, why = _classify_new_failure(r.stdout + r.stderr)
+                if kind == "fatal":
+                    sys.stderr.write(r.stdout + r.stderr)
+                    die(f"`colab {' '.join(args)}` 失败：{why}")
+                if kind == "denied":
+                    gpus.remove(gpu)
+                    print(f"  {gpu}：{why}，之后不再试")
+                    continue
+                if kind == "uncertain":
+                    _check_no_orphan(before)
+                    print(f"  {gpu}：{why}（已确认没有多开 VM），稍后重试")
+                    continue
+                print(f"  {gpu}：暂时没有空闲（{why}）")
+            if not gpus:
+                die(f"账号不能用 {'/'.join(a.gpu)}（没有权限或配额）。换一种 GPU，例如 --gpu A100。")
+            left = a.wait - (time.monotonic() - t0)
+            if left <= 0:
+                die(f"试了 {rounds} 轮（{(time.monotonic() - t0) / 60:.1f} 分钟），{'/'.join(gpus)} 都没有空闲。"
+                    f"没有开机，没有扣 CU。\n过一会儿再试，或者加大 --wait（如 --wait 30m），"
+                    f"或者多加几种 GPU（如 --gpu A100,G4,H100）。")
+            time.sleep(min(POLL_SECONDS, left))
+            print(f"  第 {rounds + 1} 轮（已等 {(time.monotonic() - t0) / 60:.1f} 分钟）")
+    except KeyboardInterrupt:
+        die(f"已中断。万一中断时刚好分配到了 VM：`colab sessions` 查看，[{a.session}] 用 `{PROG} down` 关，"
+            f"[?] 要去 Colab 网页「运行时 → 管理会话」里关。", 130)
+
+
 # ------------------------------------------------------------------ commands
 
 def cmd_up(a):
@@ -166,12 +285,10 @@ def cmd_up(a):
     if line:
         print(f"会话已存在，复用：{line}")
     else:
-        if a.gpu in ("T4", "L4"):
-            print(f"⚠️  {a.gpu} 跑 MiniMax-H3-Image 很慢甚至跑不动，建议 --gpu A100 / G4 / H100。")
-        args = ["new", "-s", a.session, "--gpu", a.gpu]
-        if not a.no_high_mem:
-            args.append("--high-mem")
-        colab(*args)
+        slow = [g for g in a.gpu if g in ("T4", "L4")]
+        if slow:
+            print(f"⚠️  {'/'.join(slow)} 跑 MiniMax-H3-Image 很慢甚至跑不动，建议 --gpu A100,G4 / H100。")
+        _allocate(a)
         print(colab("status", "-s", a.session, capture=True, check=False).stdout.strip())
     cfg = {"dit": a.dit, "enhancer": a.enhancer, "comfy_version": a.comfy_version,
            "check_location": not a.no_location_check, "extra_args": shlex.split(a.extra_args or "")}
@@ -395,7 +512,11 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("up", help="开机 + 安装 + 下载权重 + 启动 ComfyUI（可重复执行）")
-    p.add_argument("--gpu", default="A100", type=str.upper, choices=GPUS, help="默认 A100（配 --high-mem 一般是 80GB）")
+    p.add_argument("--gpu", default="A100,G4", type=_gpu_list, metavar="GPU[,GPU...]",
+                   help=f"按顺序尝试的 GPU，逗号隔开，可选 {', '.join(GPUS)}。默认 A100,G4：A100 没空就试 G4"
+                        "（G4 仅 Pro+，账号没权限会自动跳过）。A100 配 --high-mem 一般是 80GB")
+    p.add_argument("--wait", default="10m", type=_duration, metavar="时长",
+                   help=f"GPU 都没空时最多等多久，每 {POLL_SECONDS} 秒重试一轮（如 90s、15m、1h），默认 10m；0 表示只试一轮")
     p.add_argument("--no-high-mem", action="store_true", help="不申请高内存机型（不推荐）")
     p.add_argument("--dit", default="int8", choices=["int8", "bf16"], help="int8=21GB 推荐；bf16=40GB 与原版一致，需 ≥70GB 显存")
     p.add_argument("--enhancer", action="store_true", help="同时下载提示词扩写模型（+7.3GB），之后 gen/edit 可用 --enhance")
