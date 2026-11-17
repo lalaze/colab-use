@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""h3 — 在 Colab GPU 上跑 MiniMax-H3-Image，全程命令行。
+
+基于谷歌官方 Colab CLI（`colab`，安装：uv tool install google-colab-cli）。
+
+    ./h3 up                         开一台 A100 80GB，装 ComfyUI，下载权重，启动服务
+    ./h3 gen "a prompt" -n 2        文生图，结果下载到 ./outputs
+    ./h3 gen -f prompts.txt         批量（每行一条提示词，# 开头的行忽略）
+    ./h3 edit "<Picture 1> ..." a.png b.png    图像编辑 / 多图参考
+    ./h3 ui                         SSH 端口转发，本机打开 ComfyUI 网页界面
+    ./h3 status | logs | restart | shell
+    ./h3 down                       关机，停止扣 CU（用完一定要执行）
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = pathlib.Path(__file__).resolve().parent
+REMOTE = ROOT / "remote"
+DEFAULT_SESSION = os.environ.get("H3_SESSION", "h3")
+COMFY_VERSION = "v0.45.5"
+GPUS = ["A100", "G4", "H100", "L4", "T4"]
+ASPECTS = ["auto", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9"]
+
+
+def die(msg: str, code: int = 1):
+    print(f"h3: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def colab_bin() -> str:
+    path = shutil.which("colab")
+    if not path:
+        die("找不到 `colab` 命令。先安装官方 Colab CLI：\n    uv tool install google-colab-cli\n"
+            "然后随便跑一个命令（如 `colab usage`）完成 Google 账号授权。")
+    return path
+
+
+def colab(*args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+    r = subprocess.run([colab_bin(), *args], text=True, capture_output=capture)
+    if check and r.returncode != 0:
+        if capture:
+            sys.stderr.write(r.stdout + r.stderr)
+        die(f"`colab {' '.join(args)}` 失败（退出码 {r.returncode}）")
+    return r
+
+
+def session_line(name: str) -> str | None:
+    """The `colab status` line for this session, or None when colab says it does not exist.
+
+    Anything else (network hiccup, timeout) is retried and then fatal: guessing "no session"
+    would make `up` start a second VM.
+    """
+    for attempt in range(3):
+        r = colab("status", "-s", name, capture=True, check=False)
+        for line in r.stdout.splitlines():
+            if line.startswith(f"[{name}] "):
+                return line
+        if f"Session '{name}' not found" in r.stdout or "No active sessions" in r.stdout:
+            return None
+        time.sleep(3 * (attempt + 1))
+    die(f"`colab status -s {name}` 没有给出明确结果（网络问题？），稍后重试：\n{(r.stdout + r.stderr).strip()}")
+
+
+def require_session(name: str) -> str:
+    line = session_line(name)
+    if not line:
+        die(f"没有名为 {name!r} 的 Colab 会话。先运行 `./h3 up`。")
+    return line
+
+
+def remote_exec(name: str, code: str, on_result=None) -> tuple[list[dict], dict]:
+    """Run code in the session's kernel, stream its output, collect H3_RESULT / H3_DONE markers."""
+    proc = subprocess.Popen([colab_bin(), "exec", "-s", name, "--timeout", "0"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True, bufsize=1)
+    assert proc.stdin and proc.stdout
+    proc.stdin.write(code)
+    proc.stdin.close()
+    results, done = [], None
+    try:
+        for line in proc.stdout:
+            if line.startswith("H3_RESULT "):
+                results.append(json.loads(line[len("H3_RESULT "):]))
+                if on_result:
+                    on_result(results[-1])
+            elif line.startswith("H3_DONE"):
+                done = json.loads(line[len("H3_DONE"):].strip() or "{}")
+            else:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        proc.kill()
+        die("已中断本地等待。远端可能还在生成；`./h3 status` 查看，`./h3 restart` 可以清空队列。", 130)
+    proc.wait()
+    if done is None:
+        die("远端执行没有正常结束（看上面的报错）。ComfyUI 日志：`./h3 logs`")
+    return results, done
+
+
+def build_code(script: str, **variables) -> str:
+    head = "".join(f"{k} = {v!r}\n" for k, v in variables.items())
+    return head + (REMOTE / script).read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_up(a):
+    line = session_line(a.session)
+    if line:
+        print(f"会话已存在，复用：{line}")
+    else:
+        if a.gpu in ("T4", "L4"):
+            print(f"⚠️  {a.gpu} 跑 MiniMax-H3-Image 很慢甚至跑不动，建议 --gpu A100 / G4 / H100。")
+        args = ["new", "-s", a.session, "--gpu", a.gpu]
+        if not a.no_high_mem:
+            args.append("--high-mem")
+        colab(*args)
+        print(colab("status", "-s", a.session, capture=True, check=False).stdout.strip())
+    cfg = {"dit": a.dit, "enhancer": a.enhancer, "comfy_version": a.comfy_version,
+           "check_location": not a.no_location_check, "extra_args": shlex.split(a.extra_args or "")}
+    code = build_code("setup.py", H3_CFG=cfg, H3_COMFY_SRC=(REMOTE / "h3_comfy.py").read_text(encoding="utf-8"))
+    _, done = remote_exec(a.session, code)
+    print(f"\n✅ 就绪：{done.get('gpu')} {done.get('vram_gib')} GiB，DiT={done.get('dit')}，"
+          f"提示词扩写={'开' if done.get('enhancer') else '关'}，用时 {done.get('minutes')} 分钟")
+    print("下一步：./h3 gen \"your detailed English prompt\"    用完：./h3 down")
+    colab("usage", check=False)
+
+
+def _read_prompts(a) -> list[str]:
+    prompts = list(a.prompt or [])
+    if a.file:
+        for raw in pathlib.Path(a.file).read_text(encoding="utf-8").splitlines():
+            s = raw.strip()
+            if s and not s.startswith("#"):
+                prompts.append(s)
+    if not prompts:
+        die("没有提示词：./h3 gen \"prompt\" 或 ./h3 gen -f prompts.txt")
+    return prompts
+
+
+def _reserve(path: pathlib.Path) -> pathlib.Path:
+    """Atomically claim a free filename (safe with concurrent downloads)."""
+    n, cand = 1, path
+    while True:
+        try:
+            with open(cand, "x"):
+                return cand
+        except FileExistsError:
+            n += 1
+            cand = path.with_name(f"{path.stem}_{n}{path.suffix}")
+
+
+def _run_jobs(a, jobs: list[dict], tag: str):
+    out_dir = pathlib.Path(a.out).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pool = ThreadPoolExecutor(max_workers=2)
+    futures, failures = [], 0
+    run_stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def download(result: dict):
+        remote = result["paths"][0]
+        local = _reserve(out_dir / f"{tag}_{run_stamp}_{result['index']:03d}_s{result['seed']}.png")
+        r = colab("download", "-s", a.session, remote, str(local), capture=True, check=False)
+        if r.returncode != 0:
+            local.unlink(missing_ok=True)
+            print(f"  ⚠️ 下载失败 {remote}: {r.stdout.strip()} {r.stderr.strip()}"
+                  f"（可手动：colab download -s {a.session} {remote} 本地路径）")
+            return
+        local.with_suffix(".json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"  ⬇ {local}")
+
+    def on_result(result: dict):
+        nonlocal failures
+        if "error" in result:
+            failures += 1
+            print(f"  ✗ 第 {result['index']} 张失败：{result['error']}")
+            return
+        print(f"  ✓ 第 {result['index']} 张 {result['width']}x{result['height']} seed={result['seed']} "
+              f"用时 {result['seconds']}s")
+        if result.get("enhanced"):
+            p = result["prompt"]
+            print(f"    扩写后：{p[:300]}{'…' if len(p) > 300 else ''}")
+        futures.append(pool.submit(download, result))
+
+    t0 = time.time()
+    try:
+        remote_exec(a.session, build_code("generate.py", H3_JOBS=jobs), on_result=on_result)
+        for f in futures:
+            f.result()
+    finally:
+        pool.shutdown(wait=True)
+        if a.down:
+            print("--down：关闭会话…")
+            cmd_down(a)
+    ok = len(jobs) - failures
+    print(f"\n完成 {ok}/{len(jobs)} 张，总用时 {(time.time() - t0) / 60:.1f} 分钟，保存在 {out_dir}/")
+    if not a.down:
+        print("VM 还开着、还在扣 CU。用完记得：./h3 down")
+    if failures:
+        sys.exit(1)
+
+
+def cmd_gen(a):
+    require_session(a.session)
+    prompts = _read_prompts(a)
+    jobs = []
+    for prompt in prompts:
+        for j in range(a.n):
+            jobs.append({"kind": "t2i", "prompt": prompt, "aspect": a.aspect, "megapixels": a.mp,
+                         "seed": None if a.seed is None else a.seed + j, "enhance": a.enhance})
+    print(f"{len(prompts)} 条提示词 × {a.n} = {len(jobs)} 张，{a.aspect} @ {a.mp}MP")
+    _run_jobs(a, jobs, "t2i")
+
+
+def cmd_edit(a):
+    require_session(a.session)
+    if not 1 <= len(a.images) <= 16:
+        die("需要 1～16 张参考图")
+    remote_paths = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for i, img in enumerate(a.images, 1):
+        p = pathlib.Path(img).expanduser()
+        if not p.is_file():
+            die(f"找不到图片 {img}")
+        remote = f"/content/h3ref_{stamp}_{i:02d}{p.suffix.lower()}"  # /content exists; contents API won't mkdir
+        colab("upload", "-s", a.session, str(p), remote, capture=True)
+        remote_paths.append(remote)
+        print(f"  ⬆ <Picture {i}> = {p.name}")
+    jobs = [{"kind": "edit", "prompt": a.prompt, "images": remote_paths, "megapixels": a.mp,
+             "seed": None if a.seed is None else a.seed + j, "enhance": a.enhance} for j in range(a.n)]
+    _run_jobs(a, jobs, "edit")
+
+
+def cmd_ui(a):
+    require_session(a.session)
+    proxy = f"{shlex.quote(colab_bin())} ssh --proxy-mode -s {shlex.quote(a.session)}"
+    if a.identity:  # colab sends this key's public half to the VM; ssh must offer the same key
+        proxy += f" -i {shlex.quote(a.identity)}"
+    ssh = ["ssh", "-N", "-L", f"{a.port}:127.0.0.1:8188",
+           "-o", f"ProxyCommand={proxy}", "-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}",
+           "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30"]
+    if a.identity:
+        ssh += ["-i", a.identity]
+    ssh.append("root@colab-runtime")
+    print(f"👉 浏览器打开 http://127.0.0.1:{a.port}   （Ctrl-C 结束转发，VM 不会关）")
+    print("   Templates → 搜 “MiniMax-H3-Image” → Text to Image / Image Edit。模型文件已就位；")
+    print("   如果 up 时用了 --dit bf16，在 Load Diffusion Model 节点换成 *_pruned_bf16；没开 --enhancer 就关掉模板里的扩写开关。")
+    try:
+        sys.exit(subprocess.call(ssh))
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_shell(a):
+    require_session(a.session)
+    sys.exit(subprocess.call([colab_bin(), "ssh", "-s", a.session]))
+
+
+def cmd_status(a):
+    print(require_session(a.session))
+    code = ("import shutil, subprocess, json, urllib.request\n"
+            "if shutil.which('nvidia-smi'):\n"
+            "    print(subprocess.run(['nvidia-smi', '--query-gpu=name,memory.used,memory.total,utilization.gpu',"
+            " '--format=csv'], capture_output=True, text=True).stdout)\n"
+            "else:\n"
+            "    print('这台 VM 没有 GPU')\n"
+            "try:\n"
+            "    q = json.load(urllib.request.urlopen('http://127.0.0.1:8188/queue', timeout=5))\n"
+            "    print(f\"ComfyUI 运行中：正在跑 {len(q['queue_running'])}，排队 {len(q['queue_pending'])}\")\n"
+            "except Exception as e:\n"
+            "    print('ComfyUI 没有响应：', e)\n"
+            "print('H3_DONE {}')\n")
+    remote_exec(a.session, code)
+    colab("usage", check=False)
+
+
+def cmd_logs(a):
+    require_session(a.session)
+    code = (f"import collections\n"
+            f"try:\n"
+            f"    print(''.join(collections.deque(open('/content/comfyui.log', errors='replace'), maxlen={a.n})))\n"
+            f"except FileNotFoundError:\n"
+            f"    print('还没有日志（ComfyUI 没启动过）')\n"
+            f"print('H3_DONE {{}}')\n")
+    remote_exec(a.session, code)
+
+
+def cmd_restart(a):
+    require_session(a.session)
+    code = ("import json, os, signal, subprocess, sys, time\n"
+            "sys.path.insert(0, '/content')\n"
+            "import h3_comfy\n"
+            "cfg = json.load(open('/content/h3_config.json'))\n"
+            "subprocess.run(['pkill', '-f', 'main.py --listen 127.0.0.1 --port 8188'])\n"
+            "time.sleep(3)\n"
+            "proc = subprocess.Popen(cfg['launch_args'], cwd='/content/ComfyUI', stdout=open('/content/comfyui.log', 'a'),"
+            " stderr=subprocess.STDOUT, start_new_session=True)\n"
+            "h3_comfy.ComfyClient().wait_ready(timeout=600, proc=proc)\n"
+            "print('ComfyUI 已重启（显存已清空，队列已清空）')\n"
+            "print('H3_DONE {}')\n")
+    remote_exec(a.session, code)
+
+
+def cmd_down(a):
+    # `colab stop` works from local session state, so call it directly instead of a
+    # network-dependent `status` check that could make us skip the shutdown.
+    for attempt in range(3):
+        r = colab("stop", "-s", a.session, capture=True, check=False)
+        out = (r.stdout + r.stderr).strip()
+        if "Session terminated" in out:
+            print("已关机，停止计费。下载到本地的图片不受影响。")
+            return
+        if "not found" in out:
+            print(f"没有名为 {a.session!r} 的会话（可能已经关了）。`colab sessions` 查看全部。")
+            return
+        print(f"关机未确认（第 {attempt + 1} 次）：{out}")
+        time.sleep(5)
+    die(f"关机可能没成功！用 `colab sessions` 确认，必要时手动 `colab stop -s {a.session}`。")
+
+
+# ------------------------------------------------------------------ argparse
+
+def main():
+    ap = argparse.ArgumentParser(prog="h3", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Colab 会话名（默认 {DEFAULT_SESSION}，或设环境变量 H3_SESSION）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("up", help="开机 + 安装 + 下载权重 + 启动 ComfyUI（可重复执行）")
+    p.add_argument("--gpu", default="A100", type=str.upper, choices=GPUS, help="默认 A100（配 --high-mem 一般是 80GB）")
+    p.add_argument("--no-high-mem", action="store_true", help="不申请高内存机型（不推荐）")
+    p.add_argument("--dit", default="int8", choices=["int8", "bf16"], help="int8=21GB 推荐；bf16=40GB 与原版一致，需 ≥70GB 显存")
+    p.add_argument("--enhancer", action="store_true", help="同时下载提示词扩写模型（+7.3GB），之后 gen/edit 可用 --enhance")
+    p.add_argument("--comfy-version", default=COMFY_VERSION)
+    p.add_argument("--extra-args", default="", help="传给 ComfyUI 的额外参数，如 \"--reserve-vram 4\"")
+    p.add_argument("--no-location-check", action="store_true", help="不通过 ipinfo.io 查询 VM 所在地")
+    p.set_defaults(func=cmd_up)
+
+    def gen_opts(p):
+        p.add_argument("--mp", type=float, default=16, help="目标像素（百万），默认 16（最佳）；4 约快 4 倍，适合试提示词")
+        p.add_argument("--seed", type=int, default=None, help="固定 seed（-n 多张时依次 +1）；默认随机")
+        p.add_argument("-n", type=int, default=1, help="每条提示词出几张")
+        p.add_argument("--enhance", action="store_true", help="先用扩写模型改写提示词（需要 up --enhancer）")
+        p.add_argument("-o", "--out", default=str(ROOT / "outputs"), help="本地保存目录")
+        p.add_argument("--down", action="store_true", help="跑完自动关机（批量任务推荐）")
+
+    p = sub.add_parser("gen", help="文生图")
+    p.add_argument("prompt", nargs="*", help="提示词（详细的英文描述效果最好）")
+    p.add_argument("-f", "--file", help="提示词文件，每行一条")
+    p.add_argument("--aspect", default="1:1", choices=ASPECTS, help="画幅；auto 需配合 --enhance，由扩写模型推荐")
+    gen_opts(p)
+    p.set_defaults(func=cmd_gen)
+
+    p = sub.add_parser("edit", help="图像编辑 / 多图参考（提示词里用 <Picture 1>、<Picture 2>…）")
+    p.add_argument("prompt")
+    p.add_argument("images", nargs="+", help="参考图，顺序即 Picture 1、2…（最多 16 张）")
+    gen_opts(p)
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("ui", help="SSH 端口转发，在本机浏览器用 ComfyUI 网页界面")
+    p.add_argument("--port", type=int, default=8188)
+    p.add_argument("-i", "--identity", help="SSH 私钥（默认 ~/.ssh/id_ed25519；Colab 不接受 RSA）")
+    p.set_defaults(func=cmd_ui)
+
+    sub.add_parser("shell", help="SSH 登录到 VM").set_defaults(func=cmd_shell)
+    sub.add_parser("status", help="GPU / ComfyUI 队列 / CU 余额").set_defaults(func=cmd_status)
+    p = sub.add_parser("logs", help="ComfyUI 日志末尾")
+    p.add_argument("-n", type=int, default=80)
+    p.set_defaults(func=cmd_logs)
+    sub.add_parser("restart", help="重启 ComfyUI（清空显存和队列，OOM 后用）").set_defaults(func=cmd_restart)
+    sub.add_parser("down", help="关机，停止扣 CU").set_defaults(func=cmd_down)
+
+    a = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines ordered with colab's when piped
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
