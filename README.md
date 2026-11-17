@@ -70,6 +70,7 @@ CU 费率除标注实测的以外都来自社区测量。Google 不公布费率�
 1. 安装官方 Colab CLI：`uv tool install google-colab-cli`（或 `pip install google-colab-cli`）。它只支持 macOS 和 Linux。
 2. 运行任意 `colab` 命令（比如 `colab usage`），按提示在浏览器里授权 Google 账号。消耗的是这个账号的 Colab 计算单元（CU）。
 3. 如果要用 `./h3 ui` 或 `./h3 shell`，需要 `~/.ssh/id_ed25519`（Colab 不接受 RSA 密钥）。没有的话运行 `ssh-keygen -t ed25519` 生成。
+4. （可选）把 `h3` 链接进 PATH，之后在任何目录都能直接运行 `h3`：`ln -s "$PWD/h3" ~/.local/bin/h3`。
 
 ### 命令
 
@@ -94,6 +95,20 @@ CU 费率除标注实测的以外都来自社区测量。Google 不公布费率�
 模型最适合**详细的英文描述**：主体、构图、光线、材质，以及画面里要出现的文字（用引号括起来）。它不支持 negative prompt，不想要的东西直接写进正向提示词。
 
 习惯写中文短句的话，用 `./h3 up --enhancer` 额外下载 7.3 GB 的 Qwen3.5-9B，之后 `./h3 gen "一只在雪地里的橘猫" --enhance --aspect auto` 会先把中文短句扩写成英文长描述，并由它推荐画幅。
+
+### 给 agent / 脚本调用
+
+任何 agent（Claude、Codex、Cursor 等）和脚本都可以调用，前提是能执行命令行并能访问 Google。完整规则和 JSON 格式写在 `h3 --help` 里，会随工具一起更新。推荐用下面的一次性写法，无论成功失败最后都会关机：
+
+```bash
+h3 up; h3 gen "detailed English prompt" --mp 4 -o DIR --json; s=$?; h3 down; exit $s
+```
+
+加 `--json` 后，stdout 只输出 JSON Lines：每张图一行 `{"event": "image", "ok": true, "path": "...", ...}`，最后一行是 `{"event": "done", ...}`。如果还没开始生成就失败了（例如没有会话），输出的是 `{"event": "error", ...}`。退出码非 0 表示至少有一张失败，下载失败也算。
+
+在各个 agent 的说明文件（AGENTS.md、CLAUDE.md、`.cursorrules` 等）里加上这一段就够了：
+
+> 需要生成或修改图片时，用 `h3` 命令（MiniMax-H3-Image，跑在 Colab GPU 上，按开机时长计费）。调用前先运行 `h3 --help`，读其中「给 agent / 脚本调用」一节，并严格按里面的规则使用；用完必须执行 `h3 down`。
 
 ### 原理
 

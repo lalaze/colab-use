@@ -10,6 +10,24 @@
     ./h3 ui                         SSH 端口转发，本机打开 ComfyUI 网页界面
     ./h3 status | logs | restart | shell
     ./h3 down                       关机，停止扣 CU（用完一定要执行）
+
+给 agent / 脚本调用（任何 agent 都适用）：
+  一次性用法（推荐，无论成功失败最后都会关机）：
+    h3 up; h3 gen "detailed English prompt" --mp 4 -o DIR --json; s=$?; h3 down; exit $s
+  --json（gen / edit）：stdout 只输出 JSON Lines，进度信息都走 stderr。
+    {"event": "image", "ok": true, "index": 1, "path": "/abs/x.png", "meta": "/abs/x.json",
+     "seed": 1, "width": 2048, "height": 2048, "seconds": 30.5, "prompt": "..."}
+    {"event": "image", "ok": false, "index": 2, "error": "..."}
+    {"event": "done", "total": 2, "ok": 1, "failed": 1, "out_dir": "/abs/DIR", "minutes": 0.6, "vm_running": true}
+    {"event": "error", "error": "..."}    还没开始生成就失败了（例如没有会话）
+  退出码：0 表示全部成功；非 0 表示至少有一张失败（原因见 JSON 或 stderr）。
+  规则：
+    - VM 开着就按时长扣 CU（A100 约 8.9 CU/小时），用完必须 h3 down；up 失败了也要 down（所以用 ; 而不是 &&）
+    - up 约 11 分钟，16MP 每张可能要几分钟：命令超时至少给 20 分钟，或者放到后台运行
+    - 提示词写详细的英文；画面里要出现的文字用引号括起来；不支持 negative prompt；先用 --mp 4 试，定稿再用 16
+    - 默认所有调用共用一个会话（名字叫 h3，即同一台 VM），只能由一个调用方负责 down；
+      需要隔离就用 h3 -s 名字 ...（每个会话单独开一台 VM，分别计费）
+    - 需要能访问 Google（oauth2.googleapis.com、colab.research.google.com），在网络受限的沙箱里会卡住
 """
 
 from __future__ import annotations
@@ -22,19 +40,45 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REMOTE = ROOT / "remote"
 DEFAULT_SESSION = os.environ.get("H3_SESSION", "h3")
+
+
+def _prog() -> str:
+    """How to tell the user to call us again: `h3` when found via PATH, else what they typed (e.g. ./h3)."""
+    d = os.path.dirname(sys.argv[0])
+    on_path = d and any(os.path.realpath(d) == os.path.realpath(p)
+                        for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    return os.path.basename(sys.argv[0]) if on_path else sys.argv[0]
+
+
+PROG = _prog()
 COMFY_VERSION = "v0.45.5"
 GPUS = ["A100", "G4", "H100", "L4", "T4"]
 ASPECTS = ["auto", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9"]
 
 
+JSON_OUT = None  # with --json: the real stdout, reserved for JSON Lines (human output goes to stderr)
+_json_lock = threading.Lock()
+
+
+def emit(event: dict):
+    """Write one machine-readable line (only with --json)."""
+    if JSON_OUT is None:
+        return
+    with _json_lock:
+        JSON_OUT.write(json.dumps(event, ensure_ascii=False) + "\n")
+        JSON_OUT.flush()
+
+
 def die(msg: str, code: int = 1):
     print(f"h3: {msg}", file=sys.stderr)
+    emit({"event": "error", "error": msg})
     sys.exit(code)
 
 
@@ -75,7 +119,7 @@ def session_line(name: str) -> str | None:
 def require_session(name: str) -> str:
     line = session_line(name)
     if not line:
-        die(f"没有名为 {name!r} 的 Colab 会话。先运行 `./h3 up`。")
+        die(f"没有名为 {name!r} 的 Colab 会话。先运行 `{PROG} up`。")
     return line
 
 
@@ -100,10 +144,10 @@ def remote_exec(name: str, code: str, on_result=None) -> tuple[list[dict], dict]
                 sys.stdout.flush()
     except KeyboardInterrupt:
         proc.kill()
-        die("已中断本地等待。远端可能还在生成；`./h3 status` 查看，`./h3 restart` 可以清空队列。", 130)
+        die(f"已中断本地等待。远端可能还在生成；`{PROG} status` 查看，`{PROG} restart` 可以清空队列。", 130)
     proc.wait()
     if done is None:
-        die("远端执行没有正常结束（看上面的报错）。ComfyUI 日志：`./h3 logs`")
+        die(f"远端执行没有正常结束（看上面的报错）。ComfyUI 日志：`{PROG} logs`")
     return results, done
 
 
@@ -132,7 +176,7 @@ def cmd_up(a):
     _, done = remote_exec(a.session, code)
     print(f"\n✅ 就绪：{done.get('gpu')} {done.get('vram_gib')} GiB，DiT={done.get('dit')}，"
           f"提示词扩写={'开' if done.get('enhancer') else '关'}，用时 {done.get('minutes')} 分钟")
-    print("下一步：./h3 gen \"your detailed English prompt\"    用完：./h3 down")
+    print(f"下一步：{PROG} gen \"your detailed English prompt\"    用完：{PROG} down")
     colab("usage", check=False)
 
 
@@ -144,7 +188,7 @@ def _read_prompts(a) -> list[str]:
             if s and not s.startswith("#"):
                 prompts.append(s)
     if not prompts:
-        die("没有提示词：./h3 gen \"prompt\" 或 ./h3 gen -f prompts.txt")
+        die(f"没有提示词：{PROG} gen \"prompt\" 或 {PROG} gen -f prompts.txt")
     return prompts
 
 
@@ -164,8 +208,14 @@ def _run_jobs(a, jobs: list[dict], tag: str):
     out_dir = pathlib.Path(a.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     pool = ThreadPoolExecutor(max_workers=2)
-    futures, failures = [], 0
+    futures, failures, lock = [], 0, threading.Lock()
     run_stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def fail(index: int, error: str):
+        nonlocal failures
+        with lock:
+            failures += 1
+        emit({"event": "image", "ok": False, "index": index, "error": error})
 
     def download(result: dict):
         remote = result["paths"][0]
@@ -173,17 +223,20 @@ def _run_jobs(a, jobs: list[dict], tag: str):
         r = colab("download", "-s", a.session, remote, str(local), capture=True, check=False)
         if r.returncode != 0:
             local.unlink(missing_ok=True)
-            print(f"  ⚠️ 下载失败 {remote}: {r.stdout.strip()} {r.stderr.strip()}"
-                  f"（可手动：colab download -s {a.session} {remote} 本地路径）")
+            error = f"下载失败 {remote}: {r.stdout.strip()} {r.stderr.strip()}".strip()
+            print(f"  ⚠️ {error}（可手动：colab download -s {a.session} {remote} 本地路径）")
+            fail(result["index"], error)
             return
-        local.with_suffix(".json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+        meta = local.with_suffix(".json")
+        meta.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"  ⬇ {local}")
+        emit({"event": "image", "ok": True, "index": result["index"], "path": str(local.resolve()),
+              "meta": str(meta.resolve()), **{k: result.get(k) for k in ("seed", "width", "height", "seconds", "prompt")}})
 
     def on_result(result: dict):
-        nonlocal failures
         if "error" in result:
-            failures += 1
             print(f"  ✗ 第 {result['index']} 张失败：{result['error']}")
+            fail(result["index"], result["error"])
             return
         print(f"  ✓ 第 {result['index']} 张 {result['width']}x{result['height']} seed={result['seed']} "
               f"用时 {result['seconds']}s")
@@ -203,9 +256,12 @@ def _run_jobs(a, jobs: list[dict], tag: str):
             print("--down：关闭会话…")
             cmd_down(a)
     ok = len(jobs) - failures
-    print(f"\n完成 {ok}/{len(jobs)} 张，总用时 {(time.time() - t0) / 60:.1f} 分钟，保存在 {out_dir}/")
+    minutes = (time.time() - t0) / 60
+    print(f"\n完成 {ok}/{len(jobs)} 张，总用时 {minutes:.1f} 分钟，保存在 {out_dir}/")
+    emit({"event": "done", "total": len(jobs), "ok": ok, "failed": failures, "out_dir": str(out_dir.resolve()),
+          "minutes": round(minutes, 1), "vm_running": not a.down})
     if not a.down:
-        print("VM 还开着、还在扣 CU。用完记得：./h3 down")
+        print(f"VM 还开着、还在扣 CU。用完记得：{PROG} down")
     if failures:
         sys.exit(1)
 
@@ -352,6 +408,8 @@ def main():
         p.add_argument("--enhance", action="store_true", help="先用扩写模型改写提示词（需要 up --enhancer）")
         p.add_argument("-o", "--out", default=str(ROOT / "outputs"), help="本地保存目录")
         p.add_argument("--down", action="store_true", help="跑完自动关机（批量任务推荐）")
+        p.add_argument("--json", action="store_true",
+                       help="stdout 只输出 JSON Lines（每张图一行，最后一行 done），进度信息改走 stderr；给 agent / 脚本用")
 
     p = sub.add_parser("gen", help="文生图")
     p.add_argument("prompt", nargs="*", help="提示词（详细的英文描述效果最好）")
@@ -381,6 +439,9 @@ def main():
 
     a = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # keep our lines ordered with colab's when piped
+    if getattr(a, "json", False):
+        global JSON_OUT
+        JSON_OUT, sys.stdout = sys.stdout, sys.stderr  # every print() becomes progress on stderr
     a.func(a)
 
 
