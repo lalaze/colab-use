@@ -31,6 +31,8 @@
     - 提示词写详细的英文；画面里要出现的文字用引号括起来；不支持 negative prompt；先用 --mp 4 试，定稿再用 16
     - 默认所有调用共用一个会话（名字叫 h3，即同一台 VM），只能由一个调用方负责 down；
       需要隔离就用 h3 -s 名字 ...（每个会话单独开一台 VM，分别计费）
+    - 和 VM 的连接偶尔会断（Connection was lost）：up 会在同一台 VM 上自动重装（最多 3 次）；gen / edit 会报错退出，
+      VM 仍在扣 CU，按需重跑或 down
     - 需要能访问 Google（oauth2.googleapis.com、colab.research.google.com），在网络受限的沙箱里会卡住
 """
 
@@ -128,16 +130,63 @@ def require_session(name: str) -> str:
     return line
 
 
-def remote_exec(name: str, code: str, on_result=None) -> tuple[list[dict], dict]:
-    """Run code in the session's kernel, stream its output, collect H3_RESULT / H3_DONE markers."""
+# `colab exec --timeout 0` can lose its connection to the kernel, print "Connection was lost." and then wait forever
+# for output that never comes, while the VM bills (seen 2026-11-17: 25 min idle after a fresh A100 was assigned).
+# So the local side watches the stream: after colab reports a lost connection it waits LOST_GRACE seconds for any new
+# output, and in any case gives up after STALL_SECONDS of silence (longer than any quiet step of a healthy run:
+# ComfyUI's start may take up to 10 min). The environment variables are there for tests.
+LOST_GRACE = float(os.environ.get("H3_LOST_GRACE", 60))
+STALL_SECONDS = float(os.environ.get("H3_STALL_SECONDS", 15 * 60))
+SETUP_ATTEMPTS = 3
+LOST_MARK = "Connection was lost"
+
+
+class ExecLost(Exception):
+    """The local `colab exec` stopped hearing from the kernel; what ran on the VM is unknown."""
+
+
+def remote_exec(name: str, code: str, on_result=None, retryable: bool = False) -> tuple[list[dict], dict]:
+    """Run code in the session's kernel, stream its output, collect H3_RESULT / H3_DONE markers.
+
+    When the stream dies (see LOST_GRACE) a `retryable` caller gets ExecLost; anyone else ends here with a message
+    that the VM is still running."""
     proc = subprocess.Popen([colab_bin(), "exec", "-s", name, "--timeout", "0"], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, text=True, bufsize=1)
-    assert proc.stdin and proc.stdout
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    assert proc.stdin and proc.stdout and proc.stderr
     proc.stdin.write(code)
     proc.stdin.close()
+    heard, lost, gave_up = [time.monotonic()], [0.0], [""]
+
+    def note(line: str):
+        if LOST_MARK in line and not lost[0]:
+            lost[0] = time.monotonic()
+
+    def pump_stderr():
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            note(line)
+
+    def watch():
+        while proc.poll() is None:
+            time.sleep(min(5.0, LOST_GRACE / 4, STALL_SECONDS / 4))
+            quiet = time.monotonic() - heard[0]
+            if lost[0] and time.monotonic() - max(heard[0], lost[0]) > LOST_GRACE:
+                gave_up[0] = f"colab 报告连接断开（{LOST_MARK}），之后 {LOST_GRACE:.0f} 秒没有任何输出"
+            elif quiet > STALL_SECONDS:
+                gave_up[0] = f"远端 {quiet / 60:.0f} 分钟没有任何输出" if quiet >= 90 else f"远端 {quiet:.0f} 秒没有任何输出"
+            else:
+                continue
+            proc.kill()
+            return
+
+    threading.Thread(target=pump_stderr, daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
     results, done = [], None
     try:
         for line in proc.stdout:
+            heard[0] = time.monotonic()
+            note(line)
             if line.startswith("H3_RESULT "):
                 results.append(json.loads(line[len("H3_RESULT "):]))
                 if on_result:
@@ -151,6 +200,11 @@ def remote_exec(name: str, code: str, on_result=None) -> tuple[list[dict], dict]
         proc.kill()
         die(f"已中断本地等待。远端可能还在生成；`{PROG} status` 查看，`{PROG} restart` 可以清空队列。", 130)
     proc.wait()
+    if gave_up[0] and done is None:
+        if retryable:
+            raise ExecLost(gave_up[0])
+        die(f"和 VM 的连接断了：{gave_up[0]}，本地已停止等待。VM 还开着、还在扣 CU：`{PROG} status` 查看，"
+            f"不用了就 `{PROG} down`。")
     if done is None:
         die(f"远端执行没有正常结束（看上面的报错）。ComfyUI 日志：`{PROG} logs`")
     return results, done
@@ -293,7 +347,17 @@ def cmd_up(a):
     cfg = {"dit": a.dit, "enhancer": a.enhancer, "comfy_version": a.comfy_version,
            "check_location": not a.no_location_check, "extra_args": shlex.split(a.extra_args or "")}
     code = build_code("setup.py", H3_CFG=cfg, H3_COMFY_SRC=(REMOTE / "h3_comfy.py").read_text(encoding="utf-8"))
-    _, done = remote_exec(a.session, code)
+    # Setup skips finished steps, so after a lost connection it is run again on the same VM.
+    for attempt in range(1, SETUP_ATTEMPTS + 1):
+        try:
+            _, done = remote_exec(a.session, code, retryable=True)
+            break
+        except ExecLost as lost:
+            if attempt == SETUP_ATTEMPTS:
+                die(f"安装时和 VM 的连接断了 {attempt} 次（{lost}）。VM 还开着、还在扣 CU：稍后再运行 `{PROG} up` "
+                    f"会在这台 VM 上接着装，不用了就 `{PROG} down`。")
+            print(f"\n⚠️  和 VM 的连接断了（{lost}），在同一台 VM 上重新运行安装（第 {attempt + 1} 次，已完成的步骤会跳过）",
+                  flush=True)
     print(f"\n✅ 就绪：{done.get('gpu')} {done.get('vram_gib')} GiB，DiT={done.get('dit')}，"
           f"提示词扩写={'开' if done.get('enhancer') else '关'}，用时 {done.get('minutes')} 分钟")
     print(f"下一步：{PROG} gen \"your detailed English prompt\"    用完：{PROG} down")

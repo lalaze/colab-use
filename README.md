@@ -137,6 +137,7 @@ ComfyUI 作为后台进程跑在 VM 上，`remote/h3_comfy.py` 通过 `127.0.0.1
 | 授权成功了，但下一条命令又要重新登录；之前出现过 `Could not save the OAuth token to the OS keyring` | macOS 钥匙串不可写（常见于 SSH 登录的终端）。先运行 `security unlock-keychain ~/Library/Keychains/login.keychain-db`，再重新授权 |
 | `./h3 up` 报「都没有空闲」 | 这几种 GPU 一直返回 `Service Unavailable`（503）。付费也不保证能拿到卡，2026 年 6 月起 A100、H100、G4 经常紧张，官方说是算力不够（[colabtools#6014](https://github.com/googlecolab/colabtools/issues/6014)）。等待期间没有开机，不扣 CU。可以过一会儿再试，加大 `--wait`（如 `--wait 30m`），或者多加几种 GPU（如 `--gpu A100,G4,H100`） |
 | `./h3 up` 说账号下多了一台「没有本地记录的 VM」 | 申请 GPU 的请求超时了，但服务器还是分配了 VM。这台 VM 在计费，`h3 down` 和 `colab stop` 都关不掉。打开 Colab 网页，在「运行时 → 管理会话」里终止它，再重新 `./h3 up` |
+| 输出里出现 `RuntimeError: Connection was lost.`，之后很久没有动静 | `colab exec` 和 VM 内核的连接断了，它不会自己退出，VM 却一直在计费。h3 会盯着：colab 报告断开后 60 秒内没有新输出，或者 15 分钟完全没有输出，就停止等待。`up` 会在同一台 VM 上重新运行安装（最多 3 次，已完成的步骤跳过）；`gen` / `edit` 直接报错退出，不会自动重试，以免重复出图，VM 仍开着，可以重跑命令或者 `./h3 down` |
 | 下载权重很慢 | 看 `up` 日志里的 `hf_xet：` 一行：显示“未启用”说明退回了普通 HTTP |
 | 在 Claude Code 等沙箱里运行 `colab` 时卡在授权或请求超时 | 沙箱拦截了 `oauth2.googleapis.com` 等域名。在沙箱外运行 |
 
